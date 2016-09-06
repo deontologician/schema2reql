@@ -20,7 +20,7 @@ schema_to_reql_type = {
 def main(filename):
     with open(filename) as f:
         schema = json.load(f)
-    print(str(r.expr(lambda v: validate(schema, title='root')(v))))
+    print(str(r.expr(validate(schema, title='root').to_reql())))
 
 
 def validate(schema, title=''):
@@ -52,14 +52,14 @@ class Validator:
 
     def add_req(self, test, error_msg):
         '''Adds a requirement to the running tests for this schema'''
-        q = test if VERBOSE else self.to_branch(test, error_msg)
+        q = test if not VERBOSE else self.to_branch(test, error_msg)
         if self.query is None:
             self.query = q
         else:
             pq = self.query
             self.query = lambda v: pq(v) & q(v)
 
-    def __call__(self, v):
+    def to_reql(self):
         for keyword, arg in self.schema.items():
             if keyword not in META_KEYWORDS:
                 if keyword == 'not':
@@ -77,7 +77,7 @@ class Validator:
 
     def type(self, arg):
         self.add_req(
-            lambda v: v.type_of().eq(schema_to_reql_type[arg]),
+            lambda v: v.type_of() == schema_to_reql_type[arg],
             'must be of type %s' % (arg,),
         )
 
@@ -126,7 +126,7 @@ class BooleanValidator(Validator):
 class NumericValidator(Validator):
     def multipleOf(self, arg):
         self.add_req(
-            lambda v: v.mod(arg).eq(0),
+            lambda v: v % arg == 0,
             'must be a multiple of %s' % (arg,),
         )
 
@@ -155,7 +155,7 @@ class IntegerValidator(NumericValidator):
     def type(self, arg):
         self.add_req(
             lambda v: (v.type_of() == schema_to_reql_type[arg]) &
-                      (v.coerce_to('string').split('.').count() == 1),
+                      (v.floor() == arg),
             'must be an integer',
         )
 
@@ -186,7 +186,7 @@ class ObjectValidator(Validator):
                 new_title = self.title + ' ' + prop
                 q_new = r.branch(
                     v.has_fields(prop),
-                    validate(prop_schema, new_title)(v[prop]),
+                    validate(prop_schema, new_title).to_reql()(v[prop]),
                     True,
                 )
                 q = q_new if q is None else q & q_new
