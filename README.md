@@ -12,7 +12,7 @@ $ python3 schema2reql.py test.json
 You can also import it directly, and use the validator object returned by validate:
 
 ```py
-my_reql_validator = lambda v: validate(schema, title='root')(v)
+my_reql_validator = validate(schema, title='root').to_reql()
 ```
 
 ## What it looks like
@@ -40,25 +40,24 @@ Give this example schema:
 }
 ```
 
-You'll get the following reql query as out (I've reformatted for clarity):
+You'll get the following reql query as output (I've reformatted for clarity and converted from python to javascript with [multireql](https://github.com/deontologician/multireql))
 
-```python
-lambda var_2: ((
-    r.branch(var_2.has_fields(['firstName', 'lastName']),
-        True,
-        r.error('Example Schema must have the required fields: firstName,lastName')) & 
-    r.branch(var_2.type_of() == r.expr('OBJECT'),
-        True,
-        r.error('Example Schema must be of type object'))) & 
-    r.branch(((
-        r.branch(var_2.has_fields('age'),
-            r.branch((var_2 > r.expr(0)), 
-                True,
-                r.error('Example Schema age must be greater than 0')) & 
-            r.branch(((var_2.type_of() == r.expr('NUMBER')) &
-                      (var_2.coerce_to('string').split('.').count() == r.expr(1))),
-                True,
-        # yadda yadda it keeps going
+```js
+function(var_1) {
+    return (var1.type_of())
+        .eq(r.expr('OBJECT'))
+        .and(r.branch(var1.has_fields('lastName'), (var1['lastName'].type_of())
+                .eq(r.expr('STRING')), true)
+            .and(r.branch(var1.has_fields('age'), (var1['age'].type_of())
+                .eq(r.expr('NUMBER'))
+                .and((var1['age'].floor())
+                    .eq(r.expr('integer')))
+                .and((var1['age'])
+                    .gt(r.expr(0))), true))
+            .and(r.branch(var1.has_fields('firstName'), (var1['firstName'].type_of())
+                .eq(r.expr('STRING')), true)))
+        .and(var1.has_fields(['firstName', 'lastName']))
+}
 ```
 
 Really beautiful stuff
