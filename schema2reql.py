@@ -1,6 +1,7 @@
 import rethinkdb as r
 import json
 import sys
+from functools import wraps
 
 
 META_KEYWORDS = {'title', 'description', 'default'}
@@ -16,7 +17,6 @@ schema_to_reql_type = {
     'string': 'STRING',
 }
 
-
 def main(filename):
     with open(filename) as f:
         schema = json.load(f)
@@ -25,22 +25,68 @@ def main(filename):
 
 def validate(schema, title=''):
     '''Main validation function'''
-    return {
-        'array': ArrayValidator,
-        'boolean': BooleanValidator,
-        'integer': IntegerValidator,
-        'number': NumericValidator,
-        'null': NullValidator,
-        'object': ObjectValidator,
-        'string': StringValidator,
-    }[schema['type']](schema, title)
+    return Validator(schema, title).to_reql()
 
 
-class Validator:
-    def __init__(self, schema, title=''):
-        self.schema = schema
-        self.title = schema.get('title', title)
-        self.query = None
+def propfor(prop_type):
+    def _propfor(f):
+        @wraps(f)
+        def checker(self, arg):
+            check = f(self, arg)
+            if self.schema.get('type') is None:
+                # No type assertion, so emit conditionally with other
+                # soft checks dependent on a type
+                self.ctx.soft_checks.setdefault(prop_type, []).append(
+                    self.ctx.build_check(check))
+                return None, None
+            elif self.schema.get('type') == prop_type:
+                # A type assertion for this type exists, so just emit
+                # this check as a normal conjunction
+                return check
+            else:
+                # A type assertion for another type exists, don't emit
+                # anything, we can't possibly succeed
+                return None, None
+        return checker
+    return _propfor
+
+
+def conjunct(checks):
+    '''Turns an array of check functions into a single conjunction'''
+    return lambda v: r.and_(*map(lambda check: check(v), checks))
+
+
+class Context:
+    def __init__(self, verbose):
+        self.verbose = verbose
+        self.soft_checks = {}
+        self.conjunction = []
+
+    def to_reql(self):
+        '''Convert this context to a reql function'''
+        # Emit soft checks, bunching together all checks that are
+        # conditional on a particular type being asserted
+        for soft_type, checks in self.soft_checks.items():
+            self.conjunction.append(lambda v: r.branch(
+                v.type_of() == schema_to_reql_type[soft_type],
+                conjunct(checks)(v),
+                True  # if type doesn't match, it's ok
+            ))
+        return conjunct(self.conjunction)
+
+    def also(self, check):
+        '''Adds a requirement to the running tests for this schema'''
+        if check[0] is not None:
+            self.conjunction.append(self.build_check(check))
+
+    def build_check(self, check):
+        test, error_msg = check
+        if self.verbose:
+            # TODO: check if we're reverse logic to decide whether to
+            # demorgan this branch
+            return self.to_branch(test, error_msg)
+        else:
+            return test
 
     def to_branch(self, test, error_msg):
         '''Turns a normal test into an ugly but helpful branch/error test'''
@@ -50,135 +96,158 @@ class Validator:
             r.error(self.title + ' ' + error_msg),
         )
 
-    def add_req(self, test, error_msg):
-        '''Adds a requirement to the running tests for this schema'''
-        q = test if not VERBOSE else self.to_branch(test, error_msg)
-        if self.query is None:
-            self.query = q
-        else:
-            pq = self.query
-            self.query = lambda v: pq(v) & q(v)
+
+class Validator:
+    def __init__(self, schema, title='', verbose=False):
+        self.schema = schema
+        self.title = schema.get('title', title)
+        self.ctx = None
+        self.verbose = False
 
     def to_reql(self):
-        for keyword, arg in self.schema.items():
-            if keyword not in META_KEYWORDS:
-                if keyword == 'not':
-                    keyword = 'not_'
-                getattr(self, keyword)(arg)
-        return self.query
+        self.ctx = Context(self.verbose)
+        if 'type' in self.schema:
+            self.ctx.also(self.type(self.schema['type']))
+        for keyword, spec in self.schema.items():
+            if keyword in ('type', 'description', 'title'):
+                continue  # already handled
+            if keyword == 'not':
+                keyword = 'not_'  # python keyword collision!
+            try:
+                self.ctx.also(getattr(self, keyword)(self.schema[keyword]))
+            except AttributeError as ae:
+                raise NotImplementedError(keyword)
+        return self.ctx.to_reql()
+
+    def default(self, arg):
+        '''No-op'''
+        return None, None
+
+    def type(self, arg):
+        def type_check(v):
+            def type_to_reql(t):
+                check = v.type_of() == schema_to_reql_type[t]
+                if t == 'integer':
+                    # Add additional check for integers
+                    check = check & (v.floor() == v)
+                return check
+
+            if isinstance(arg, list):
+                check = r.or_(*map(type_to_reql, arg))
+            else:
+                check = type_to_reql(arg)
+            return check
+
+        return (type_check, 'type must be %s' % (arg,))
 
     # keywords for any instance type
 
     def enum(self, arg):
-        self.add_req(
+        return (
             lambda v: r.expr(arg).contains(v),
             'must be equal to one of [%s]' % (', '.join(map(repr, arg))),
         )
 
-    def type(self, arg):
-        self.add_req(
-            lambda v: v.type_of() == schema_to_reql_type[arg],
-            'must be of type %s' % (arg,),
-        )
+    # def allOf(self, arg):
+    #     raise NotImplementedError('allOf')
 
-    def allOf(self, arg):
-        raise NotImplementedError('allOf')
+    # def anyOf(self, arg):
+    #     raise NotImplementedError('anyOf')
 
-    def anyOf(self, arg):
-        raise NotImplementedError('anyOf')
+    # def oneOf(self, arg):
+    #     raise NotImplementedError('oneOf')
 
-    def oneOf(self, arg):
-        raise NotImplementedError('oneOf')
+    # def not_(self, arg):
+    #     'Tricky! In verbose mode need to pass down info not to raise errors'
+    #     raise NotImplementedError('not')
 
-    def not_(self, arg):
-        'Tricky! In verbose mode need to pass down info not to raise errors'
-        raise NotImplementedError('not')
-
-
-class StringValidator(Validator):
+    @propfor('string')
     def maxLength(self, arg):
-        self.add_req(
+        return (
             lambda v: v.count() <= arg,
             'must have length at most %s' % (arg,),
         )
 
+    @propfor('string')
     def minLength(self, arg):
-        self.add_req(
+        return (
             lambda v: v.count() >= arg,
             'must have length at least %s' % (arg,),
         )
 
+    @propfor('string')
     def pattern(self, arg):
-        self.add_req(
+        return (
             lambda v: v.match(arg),
             'must match the regex "%s"' % (arg,),
         )
 
-
-class NullValidator(Validator):
-    '''The default type_of check does everything'''
-
-
-class BooleanValidator(Validator):
-    '''The default typeof check does everything'''
-
-
-class NumericValidator(Validator):
+    @propfor('number')
     def multipleOf(self, arg):
-        self.add_req(
-            lambda v: v % arg == 0,
+        # You'd think we could do a mod here, but it has to work for
+        # floats too apparently. So we check if dividing results in a
+        # whole number instead
+        return (
+            lambda v: r.do(v.div(arg), lambda r: r.floor() == r),
             'must be a multiple of %s' % (arg,),
         )
 
+    @propfor('number')
     def maximum(self, arg):
-        self.add_req(
-            lambda v: v < arg,
-            'must be less than %s' % (arg,),
-        )
+        if self.schema.get('exclusiveMaximum') is True:
+            return (
+                lambda v: v < arg,
+                'must be less than %s' % (arg,),
+            )
+        else:
+            return (
+                lambda v: v <= arg,
+                'must be at most than %s' % (arg,),
+            )
 
+    @propfor('number')
     def minimum(self, arg):
-        self.add_req(
-            lambda v: v > arg,
-            'must be greater than %s' % (arg,),
-        )
+        if self.schema.get('exclusiveMinimum') is True:
+            return (
+                lambda v: v > arg,
+                'must be greater than %s' % (arg,),
+            )
+        else:
+            return (
+                lambda v: v >= arg,
+                'must be at least %s' % (arg,),
+            )
 
     def exclusiveMaximum(self, arg):
-        'Essentially a flag for maximum'
-        raise NotImplementedError('exclusiveMaximum')
+        'A flag for maximum'
+        return None, None  # no-op
 
     def exclusiveMinimum(self, arg):
-        'A flag for minimum, not a check in its own right'
-        raise NotImplementedError('exclusiveMinimum')
+        'A flag for minimum'
+        return None, None  # no-op
 
-
-class IntegerValidator(NumericValidator):
-    def type(self, arg):
-        self.add_req(
-            lambda v: (v.type_of() == schema_to_reql_type[arg]) &
-                      (v.floor() == arg),
-            'must be an integer',
-        )
-
-
-class ObjectValidator(Validator):
+    @propfor('object')
     def maxProperties(self, arg):
-        self.add_req(
+        return (
             lambda obj: obj.count() <= arg,
             'must not have more than %s properties' % (arg,),
         )
 
+    @propfor('object')
     def minProperties(self, arg):
-        self.add_req(
+        return (
             lambda obj: obj.count() >= arg,
             'must have at least %s properties' % (arg,),
         )
 
+    @propfor('object')
     def required(self, arg):
-        self.add_req(
+        return (
             lambda v: v.has_fields(arg),
             'must have the required fields: %s' % (','.join(arg),),
         )
 
+    @propfor('object')
     def properties(self, arg):
         def prop_check(v):
             q = None
@@ -186,46 +255,61 @@ class ObjectValidator(Validator):
                 new_title = self.title + ' ' + prop
                 q_new = r.branch(
                     v.has_fields(prop),
-                    validate(prop_schema, new_title).to_reql()(v[prop]),
+                    validate(prop_schema, new_title)(v[prop]),
                     True,
                 )
                 q = q_new if q is None else q & q_new
             return q
-        self.add_req(prop_check, 'properties must validate')
+        return (prop_check, 'properties must validate')
 
-    def patternProperties(self, arg):
-        raise NotImplementedError('patternProperties')
+    # @propfor('object')
+    # def patternProperties(self, arg):
+    #     raise NotImplementedError('patternProperties')
 
-    def dependencies(self, arg):
-        raise NotImplementedError('dependencies')
+    # @propfor('object')
+    # def dependencies(self, arg):
+    #     raise NotImplementedError('dependencies')
 
-    def additionalProperties(self, arg):
-        raise NotImplementedError('additionalProperties')
+    # @propfor('object')
+    # def additionalProperties(self, arg):
+    #     raise NotImplementedError('additionalProperties')
 
+    # @propfor('array')
+    # def items(self, arg):
+    #     'This should really be implemented...'
+    #     raise NotImplementedError('items')
 
-class ArrayValidator(Validator):
+    # @propfor('array')
+    # def additionalItems(self, arg):
+    #     raise NotImplementedError('additionalItems')
 
-    def items(self, arg):
-        'This should really be implemented...'
-        raise NotImplementedError('items')
-
-    def additionalItems(self, arg):
-        raise NotImplementedError('additionalItems')
-
+    @propfor('array')
     def maxItems(self, arg):
-        self.add_req(
+        return (
             lambda v: v.count() <= arg,
             'must have at most %s items' % (arg,),
         )
 
+    @propfor('array')
     def minItems(self, arg):
-        self.add_req(
+        return (
             lambda v: v.count() >= arg,
             'must have at least %s items' % (arg,),
         )
 
-    def uniqueItems(self, arg):
-        raise NotImplementedError('uniqueItems')
+    # @propfor('array')
+    # def uniqueItems(self, arg):
+    #     raise NotImplementedError('uniqueItems')
+
+    def ref(self, arg):
+        return None, None
+
+    def __getattr__(self, name):
+        if name == '$ref':
+            return self.ref
+        else:
+            raise NotImplementedError(name)
+
 
 
 if __name__ == '__main__':
