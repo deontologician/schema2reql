@@ -17,7 +17,9 @@ locale.setlocale(locale.LC_ALL, 'en_US.utf-8')
 
 @click.command()
 @click.option('--match', default='', help='glob to match filenames')
-def main(match):
+@click.option('--print-success', default=False, is_flag=True,
+              help='Whether to print test info on success')
+def main(match, print_success):
     conn = r.connect()
     results = {}
     for testfilename in glob.glob(TESTFILES + match + '*.json'):
@@ -49,6 +51,10 @@ def main(match):
                 if passed:
                     click.secho('passed', fg='green')
                     results[name]['passed'] += 1
+                    if print_success:
+                        click.echo('    Data: ' + json.dumps(test['data']))
+                        click.echo('    Schema: ' + json.dumps(td['schema']))
+                        click.echo('    ReQL: ' + str(r.expr(schema_filter)))
                 else:
                     click.secho('failed', fg='red', bold=True)
                     results[name]['failed'] += 1
