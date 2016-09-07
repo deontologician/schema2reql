@@ -17,6 +17,7 @@ schema_to_reql_type = {
     'string': 'STRING',
 }
 
+
 def main(filename):
     with open(filename) as f:
         schema = json.load(f)
@@ -53,6 +54,10 @@ def propfor(prop_type):
 
 def conjunct(checks):
     '''Turns an array of check functions into a single conjunction'''
+    if len(checks) == 0:
+        return lambda v: True
+    if len(checks) == 1:
+        return checks[0]
     return lambda v: r.and_(*map(lambda check: check(v), checks))
 
 
