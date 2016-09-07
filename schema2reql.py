@@ -183,7 +183,7 @@ class Validator:
     @propfor('string')
     def pattern(self, arg):
         return (
-            lambda v: v.match(arg),
+            lambda v: v.match(arg) != None,
             'must match the regex "%s"' % (arg,),
         )
 
