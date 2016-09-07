@@ -21,12 +21,12 @@ schema_to_reql_type = {
 def main(filename):
     with open(filename) as f:
         schema = json.load(f)
-    print(str(r.expr(validate(schema, title='root').to_reql())))
+    print(str(r.expr(validate(schema, path='#').to_reql())))
 
 
-def validate(schema, title=''):
+def validate(schema, path='#'):
     '''Main validation function'''
-    return Validator(schema, title).to_reql()
+    return Validator(schema, path).to_reql()
 
 
 def propfor(prop_type):
@@ -58,7 +58,7 @@ def conjunct(checks):
         return lambda v: True
     if len(checks) == 1:
         return checks[0]
-    return lambda v: r.and_(*map(lambda check: check(v), checks))
+    return lambda v: r.and_(*list(map(lambda check: check(v), checks)))
 
 
 class Context:
@@ -98,16 +98,16 @@ class Context:
         return lambda v: r.branch(
             test(v),
             True,
-            r.error(self.title + ' ' + error_msg),
+            r.error(self.path + ' ' + error_msg),
         )
 
 
 class Validator:
-    def __init__(self, schema, title='', verbose=False):
+    def __init__(self, schema, path='#', verbose=False):
         self.schema = schema
-        self.title = schema.get('title', title)
+        self.path = path
         self.ctx = None
-        self.verbose = False
+        self.verbose = verbose
 
     def to_reql(self):
         self.ctx = Context(self.verbose)
@@ -255,34 +255,55 @@ class Validator:
     @propfor('object')
     def properties(self, arg):
         def prop_check(v):
-            q = None
+            props = []
             for prop, prop_schema in arg.items():
-                new_title = self.title + ' ' + prop
-                q_new = r.branch(
+                sub_path = self.path + '/' + prop
+                props.append(r.branch(
                     v.has_fields(prop),
-                    validate(prop_schema, new_title)(v[prop]),
+                    r.do(v[prop], validate(prop_schema, sub_path)),
                     True,
-                )
-                q = q_new if q is None else q & q_new
-            return q
-        return (prop_check, 'properties must validate')
+                ))
+            return r.and_(*props)
+        return prop_check, 'properties must all validate'
 
-    # @propfor('object')
-    # def patternProperties(self, arg):
-    #     raise NotImplementedError('patternProperties')
+    @propfor('object')
+    def additionalProperties(self, arg):
+        properties = self.schema.get('properties', {})
+        pattern_props = self.schema.get('patternProperties', {})
+        addntl = self.schema.get('additionalProperties')
+        if addntl is True or addntl == {}:
+            return None, None
+        def validator(v):
+            props = v.keys()
+            if properties:
+                props = props.set_difference(properties.keys())
+            if pattern_props:
+                pats = pattern_props.keys()
+                super_pattern = '(?:' + ')|(?:'.join(pats) + ')'
+                props = props.filter(
+                    lambda x: x.match(super_pattern) == None)
+            return props.is_empty()
+        return (validator, 'additional properties must validate')
+
+    def patternProperties(self, arg):
+        return None, None
 
     # @propfor('object')
     # def dependencies(self, arg):
     #     raise NotImplementedError('dependencies')
 
-    # @propfor('object')
-    # def additionalProperties(self, arg):
-    #     raise NotImplementedError('additionalProperties')
-
-    # @propfor('array')
-    # def items(self, arg):
-    #     'This should really be implemented...'
-    #     raise NotImplementedError('items')
+    @propfor('array')
+    def items(self, arg):
+        'This should really be implemented...'
+        items = self.schema.get('items')
+        def check(v):
+            if isinstance(items, dict):
+                print('going to validate', items)
+                return v.filter(lambda x: ~validate(items)(x)).is_empty()
+            elif isinstance(items, list):
+                return r.and_(*[r.do(v.nth(i), validator)
+                          for i, validator in enumerate(map(validate, items))])
+        return check, 'items in array must validate'
 
     # @propfor('array')
     # def additionalItems(self, arg):
